@@ -1,81 +1,154 @@
 import streamlit as st
 import pandas as pd
 import io
-from logic_helpers import clean_po_data, parse_barcode
+from datetime import datetime, timedelta
 
-st.set_page_config(page_title="Lotus Preparation", layout="wide")
+# ======================================================
+# إعدادات الصفحة
+# ======================================================
+st.set_page_config(page_title="لوتس - لجنة التحضير", layout="wide")
 
-# --- تهيئة المخزن المؤقت (Session State) ---
+# استايل خاص للهاند هيلد عشان الكلام يبقى واضح
+st.markdown("""
+    <style>
+    .stTextInput > div > div > input { font-size: 25px !important; height: 60px !important; }
+    [data-testid="stMetricValue"] { font-size: 30px; }
+    </style>
+    """, unsafe_allow_html=True)
+
+# ======================================================
+# دوال المنطق (Logic)
+# ======================================================
+def clean_po_data(df):
+    """تنظيف الأعمدة وتوحيد الأسماء"""
+    df.columns = [str(c).strip() for c in df.columns]
+    rename_map = {}
+    for col in df.columns:
+        c_low = col.lower()
+        if 'material' in c_low and 'desc' not in c_low: rename_map[col] = 'Material'
+        if 'desc' in c_low or 'short text' in c_low: rename_map[col] = 'Description'
+        if 'qty' in c_low or 'quantity' in c_low: rename_map[col] = 'Required'
+    
+    df.rename(columns=rename_map, inplace=True)
+    
+    # تحويل كود الصنف لنص (String) وتوحيد شكله
+    if 'Material' in df.columns:
+        df['Material'] = df['Material'].astype(str).str.split('.').str[0].str.strip()
+    
+    # التأكد من أن عمود المطلوب أرقام
+    if 'Required' in df.columns:
+        df['Required'] = pd.to_numeric(df['Required'], errors='coerce').fillna(0).astype(int)
+        
+    return df
+
+def parse_barcode(text):
+    """فك الباركود بنظام النقطة"""
+    text = str(text).strip()
+    if '.' not in text:
+        return text, "No Date"
+    parts = text.split('.')
+    try:
+        days_diff = int(parts[1])
+        date = (datetime(2000, 1, 1) + timedelta(days=days_diff - 1)).strftime("%d/%m/%Y")
+        return parts[0].strip(), date
+    except:
+        return parts[0].strip(), "Invalid"
+
+# ======================================================
+# إدارة الجلسة (Session State)
+# ======================================================
 if 'po_df' not in st.session_state:
     st.session_state.po_df = None
 if 'scanned_data' not in st.session_state:
-    st.session_state.scanned_data = {} # {material_id: {total: 0, expiries: {}}}
+    st.session_state.scanned_data = {} # {mat_id: count}
+if 'expiry_log' not in st.session_state:
+    st.session_state.expiry_log = []
 
-# --- الواجهة ---
-st.title("📦 نظام لجنة التحضير")
+# ======================================================
+# الواجهة (UI)
+# ======================================================
+st.title("📦 محضر لجنة التحضير الذكي")
 
-# 1. رفع ملف الـ PO
-uploaded_file = st.sidebar.file_uploader("ارفع ملف الـ PO (Excel)", type=['xlsx'])
+# القائمة الجانبية
+with st.sidebar:
+    st.header("📂 إدارة الملفات")
+    uploaded_file = st.file_uploader("ارفع ملف الـ PO", type=['xlsx', 'xls', 'csv'])
+    
+    if uploaded_file and st.session_state.po_df is None:
+        try:
+            if uploaded_file.name.endswith('.csv'):
+                df_raw = pd.read_csv(uploaded_file)
+            else:
+                df_raw = pd.read_excel(uploaded_file, engine='openpyxl')
+            
+            st.session_state.po_df = clean_po_data(df_raw)
+            st.success("✅ تم تحميل البيانات!")
+        except Exception as e:
+            st.error(f"خطأ في قراءة الملف: {e}")
 
-if uploaded_file and st.session_state.po_df is None:
-    raw_df = pd.read_excel(uploaded_file)
-    st.session_state.po_df = clean_po_data(raw_df)
-    st.sidebar.success("تم تحميل البيانات!")
+    if st.button("🗑 مسح كل البيانات والبدء مجدداً"):
+        for key in ['po_df', 'scanned_data', 'expiry_log']:
+            st.session_state[key] = None if key == 'po_df' else ({} if key == 'scanned_data' else [])
+        st.rerun()
 
+# منطقة العمل الرئيسية
 if st.session_state.po_df is not None:
-    # 2. خانة السكانر (التركيز الأساسي للهاند هيلد)
-    barcode_input = st.text_input("👇 اسحب الباركود هنا (Scanner)", key="barcode_field")
+    # إحصائيات سريعة
+    total_items = len(st.session_state.po_df)
+    scanned_count = len(st.session_state.scanned_data)
+    
+    c1, c2 = st.columns(2)
+    c1.metric("إجمالي الأصناف", total_items)
+    c2.metric("أصناف تم مسحها", scanned_count)
 
-    if barcode_input:
-        mat_id, exp_date = parse_barcode(barcode_input)
+    # خانة السكانر
+    barcode = st.text_input("👇 وجه الليزر هنا وابدأ المسح", key="scanner_input")
+
+    if barcode:
+        mat_id, exp_date = parse_barcode(barcode)
         
-        # التأكد أن الصنف موجود في الملف المرفوع
-        if str(mat_id) in st.session_state.po_df['Material'].astype(str).values:
-            # تحديث الكميات
-            if mat_id not in st.session_state.scanned_data:
-                st.session_state.scanned_data[mat_id] = {"total": 0, "expiries": {}}
-            
-            st.session_state.scanned_data[mat_id]["total"] += 1
-            st.session_state.scanned_data[mat_id]["expiries"][exp_date] = \
-                st.session_state.scanned_data[mat_id]["expiries"].get(exp_date, 0) + 1
-            
-            st.toast(f"✅ تم مسح: {mat_id}", icon="🔥")
+        # التأكد من وجود الصنف في الملف (البحث في النص الموحد)
+        if mat_id in st.session_state.po_df['Material'].values:
+            # زيادة العدد
+            st.session_state.scanned_data[mat_id] = st.session_state.scanned_data.get(mat_id, 0) + 1
+            # إضافة سجل التاريخ
+            st.session_state.expiry_log.append({
+                "Material": mat_id,
+                "Expiry": exp_date,
+                "Time": datetime.now().strftime("%H:%M:%S")
+            })
+            st.toast(f"✅ تم تسجيل صنف: {mat_id}", icon="🚀")
         else:
-            st.error(f"❌ الصنف {mat_id} غير موجود في أمر التحضير!")
+            st.error(f"❌ الصنف {mat_id} مش موجود في الملف ده!")
 
-    # 3. عرض الجدول الحي
-    st.subheader("📊 حالة التحضير الحالية")
-    
-    display_df = st.session_state.po_df.copy()
-    display_df['Scanned'] = display_df['Material'].astype(str).apply(
-        lambda x: st.session_state.scanned_data.get(x, {}).get('total', 0)
-    )
-    display_df['Difference'] = display_df['Required'] - display_df['Scanned']
-    
-    # تلوين الصفوف (اختياري)
-    st.dataframe(display_df, use_container_width=True)
-
-    # 4. التصدير (Export)
+    # عرض الجدول ومعالجة الفروقات
     st.divider()
-    if st.button("💾 استخراج تقرير التحضير النهائي"):
+    
+    # بناء جدول العرض بأمان لتجنب خطأ الـ apply
+    display_df = st.session_state.po_df.copy()
+    
+    # دالة جلب الكمية بأمان
+    def get_count(m_id):
+        return st.session_state.scanned_data.get(str(m_id), 0)
+
+    display_df['Scanned'] = display_df['Material'].apply(get_count)
+    display_df['Difference'] = display_df['Required'] - display_df['Scanned']
+
+    st.subheader("📋 كشف المتابعة")
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+    # التصدير
+    if st.button("💾 تحميل تقرير الفروقات (Excel)"):
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             display_df.to_excel(writer, index=False, sheet_name='Summary')
-            # إضافة تفاصيل التواريخ في شيت منفصل
-            exp_list = []
-            for m, data in st.session_state.scanned_data.items():
-                for d, q in data['expiries'].items():
-                    exp_list.append({"Material": m, "Expiry": d, "Qty": q})
-            pd.DataFrame(exp_list).to_excel(writer, index=False, sheet_name='Expiry_Details')
+            pd.DataFrame(st.session_state.expiry_log).to_excel(writer, index=False, sheet_name='Log')
         
         st.download_button(
-            label="اضغط هنا لتحميل ملف Excel",
+            label="اضغط هنا لتحميل الملف",
             data=output.getvalue(),
-            file_name=f"Prep_Report_{uploaded_file.name}",
+            file_name=f"Prep_Report_{datetime.now().strftime('%m%d_%H%M')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
-
-    if st.sidebar.button("🗑 مسح البيانات والبدء من جديد"):
-        st.session_state.po_df = None
-        st.session_state.scanned_data = {}
-        st.rerun()
+else:
+    st.info("قم برفع ملف الـ PO من القائمة الجانبية للبدء.")
