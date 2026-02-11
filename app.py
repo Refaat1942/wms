@@ -24,8 +24,8 @@ st.markdown("""
     }
     /* تنسيق الجدول */
     .stDataFrame { direction: rtl; }
-    /* إخفاء كلمة NaN */
-    td { text-align: right !important; }
+    /* محاولة إخفاء القيم المزعجة بصرياً */
+    [data-testid="stDataFrame"] td { font-family: 'Arial'; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -37,7 +37,7 @@ def clean_po_data(df):
     # تنظيف أسماء الأعمدة
     df.columns = [str(c).strip() for c in df.columns]
     
-    # خريطة الأعمدة بناءً على ملفك
+    # خريطة الأعمدة
     rename_map = {
         'Material': 'Code', 
         'Short Text': 'Name', 
@@ -56,12 +56,13 @@ def clean_po_data(df):
     # معالجة القيم الفارغة (NaN Removal)
     df['Code'] = df['Code'].astype(str).str.split('.').str[0].str.strip()
     df['Name'] = df['Name'].fillna("").astype(str)
+    # تحويل الكميات لأرقام
     df['Required'] = pd.to_numeric(df['Required'], errors='coerce').fillna(0).astype(int)
     
     return df
 
 def parse_barcode_sap(text):
-    """معادلة التواريخ (SAP Logic)"""
+    """معادلة التواريخ (SAP Logic: 01.01.2000 + days)"""
     text = str(text).strip()
     
     # المعادلة: الكود.عدد الأيام
@@ -73,13 +74,15 @@ def parse_barcode_sap(text):
             
             # معادلة ساب: 01.01.2000 + عدد الأيام
             base_date = datetime(2000, 1, 1)
+            # تم استخدام days_diff - 1 لضبط الحساب كما في الكود القديم
             expiry_date = (base_date + timedelta(days=days_diff - 1)).strftime("%d/%m/%Y")
             
             return mat_code, expiry_date
         except:
-            return text.split('.')[0], "Invalid Date"
+            # في حالة الفشل نرجع الكود فقط وبدون تاريخ
+            return text.split('.')[0], ""
     
-    return text, "No Date"
+    return text, ""
 
 # ======================================================
 # 4. إدارة الحالة (Session State)
@@ -88,6 +91,8 @@ if 'po_df' not in st.session_state:
     st.session_state.po_df = None
 if 'scanned_data' not in st.session_state:
     st.session_state.scanned_data = {} # {Code: Quantity}
+if 'expiry_map' not in st.session_state:
+    st.session_state.expiry_map = {} # {Code: Last_Expiry_Date}
 if 'expiry_log' not in st.session_state:
     st.session_state.expiry_log = []
 if 'auth_required' not in st.session_state:
@@ -132,8 +137,11 @@ if st.session_state.po_df is not None:
                 mat_to_add = st.session_state.pending_scan['mat']
                 exp_to_add = st.session_state.pending_scan['exp']
                 
-                # الزيادة الجبرية
+                # الزيادة الجبرية وتحديث التاريخ
                 st.session_state.scanned_data[mat_to_add] = st.session_state.scanned_data.get(mat_to_add, 0) + 1
+                if exp_to_add: # تحديث التاريخ فقط لو موجود
+                    st.session_state.expiry_map[mat_to_add] = exp_to_add
+                
                 st.session_state.expiry_log.append({
                     "Code": mat_to_add, "Expiry": exp_to_add, "Time": datetime.now().strftime("%H:%M:%S"), "Note": "Over-delivery (Authorized)"
                 })
@@ -151,7 +159,7 @@ if st.session_state.po_df is not None:
             st.rerun()
 
     else:
-        # 2. خانة السكانر (تظهر فقط لو مفيش طلب باسورد)
+        # 2. خانة السكانر
         barcode = st.text_input("👇 اسحب الباركود هنا", key="scanner_input", placeholder="Scan Barcode...")
 
         if barcode:
@@ -166,6 +174,10 @@ if st.session_state.po_df is not None:
                 if current_qty < required_qty:
                     # سماح بالمسح الطبيعي
                     st.session_state.scanned_data[mat_id] = current_qty + 1
+                    # حفظ تاريخ الصلاحية في الجدول الرئيسي
+                    if exp_date:
+                        st.session_state.expiry_map[mat_id] = exp_date
+                        
                     st.session_state.expiry_log.append({
                         "Code": mat_id, "Expiry": exp_date, "Time": datetime.now().strftime("%H:%M:%S"), "Note": "Normal"
                     })
@@ -178,49 +190,68 @@ if st.session_state.po_df is not None:
             else:
                 st.error(f"❌ الصنف {mat_id} غير موجود في الـ PO")
 
-    # 3. عرض الجدول المحسن (تم إصلاح الخطأ هنا)
+    # 3. عرض الجدول المحسن
     st.divider()
     
     # تجهيز الداتا للعرض
     df_display = st.session_state.po_df.copy()
+    
+    # جلب الكميات المسحوبة
     df_display['Scanned'] = df_display['Code'].map(st.session_state.scanned_data).fillna(0).astype(int)
+    
+    # جلب تاريخ الصلاحية
+    df_display['Expiry Date'] = df_display['Code'].map(st.session_state.expiry_map).fillna("")
+
     df_display['Remaining'] = df_display['Required'] - df_display['Scanned']
     
-    # إضافة عمود الحالة (Status) للتلوين
+    # تحديد الحالة للتلوين
     def get_status(row):
-        if row['Scanned'] == 0: return "Pending"
-        if row['Scanned'] < row['Required']: return "In Progress"
-        if row['Scanned'] == row['Required']: return "Completed"
+        scanned = row['Scanned']
+        required = row['Required']
+        if scanned == 0: return "Pending"
+        if scanned < required: return "In Progress"
+        if scanned == required: return "Completed"
         return "Over Delivered"
 
     df_display['Status'] = df_display.apply(get_status, axis=1)
 
-    # دالة التلوين (تم التعديل لترجع قائمة ألوان لكل الصف)
+    # تنظيف الأصفار (تحويل الأصفار لنصوص فارغة للعرض فقط)
+    # ملاحظة: هذا للعرض فقط حتى لا يؤثر على الحسابات
+    df_show = df_display.copy()
+    df_show['Scanned'] = df_show['Scanned'].replace(0, "")
+    df_show['Remaining'] = df_show['Remaining'].replace(0, "")
+    
+    # دالة التلوين
     def highlight_rows(row):
         color = ''
-        if row['Status'] == 'Completed':
-            color = 'background-color: #d4edda; color: #155724;' # أخضر فاتح
-        elif row['Status'] == 'Over Delivered':
-            color = 'background-color: #f8d7da; color: #721c24;' # أحمر فاتح
-        elif row['Status'] == 'In Progress':
-            color = 'background-color: #fff3cd; color: #856404;' # أصفر فاتح
+        status = row['Status'] # نستخدم الحالة من البيانات الأصلية
+        if status == 'Completed':
+            color = 'background-color: #d4edda; color: #155724;' 
+        elif status == 'Over Delivered':
+            color = 'background-color: #f8d7da; color: #721c24;' 
+        elif status == 'In Progress':
+            color = 'background-color: #fff3cd; color: #856404;' 
         
-        # التعديل الهام: إرجاع قائمة باللون مكررة بعدد الأعمدة
         return [color] * len(row)
 
     st.subheader("📋 تقرير التحضير اللحظي")
+    
+    # ترتيب الأعمدة للعرض
+    cols_to_show = ['Code', 'Name', 'Expiry Date', 'Required', 'Scanned', 'Remaining', 'Status']
+    
     st.dataframe(
-        df_display[['Code', 'Name', 'Required', 'Scanned', 'Remaining', 'Status']].style.apply(highlight_rows, axis=1),
+        df_show[cols_to_show].style.apply(highlight_rows, axis=1),
         use_container_width=True,
         height=500
     )
 
-    # 4. التصدير
+    # 4. التصدير (Excel)
     c1, c2 = st.columns(2)
     with c1:
         if st.button("💾 تحميل شيت الفروقات"):
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                # تصدير البيانات الأصلية (بالأرقام وليس الفراغات)
                 df_display.to_excel(writer, index=False, sheet_name='Summary')
                 if st.session_state.expiry_log:
                     pd.DataFrame(st.session_state.expiry_log).to_excel(writer, index=False, sheet_name='Details')
