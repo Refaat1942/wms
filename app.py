@@ -6,7 +6,6 @@ from datetime import datetime, timedelta
 # ======================================================
 # 1. إعدادات المشرف (Admin Config)
 # ======================================================
-# غير الباسورد دي براحتك
 ADMIN_PASSWORD = "123" 
 
 st.set_page_config(page_title="WMS - لجنة التحضير الذكية", layout="wide")
@@ -122,7 +121,6 @@ with st.sidebar:
 if st.session_state.po_df is not None:
 
     # 1. منطق التخويل (Admin Auth Dialog)
-    # لو فيه عملية معلقة محتاجة باسورد
     if st.session_state.auth_required:
         st.warning("⚠️ الكمية المطلوبة اكتملت! مطلوب إذن مشرف للزيادة.")
         col_pass, col_btn = st.columns([3, 1])
@@ -180,7 +178,7 @@ if st.session_state.po_df is not None:
             else:
                 st.error(f"❌ الصنف {mat_id} غير موجود في الـ PO")
 
-    # 3. عرض الجدول المحسن
+    # 3. عرض الجدول المحسن (تم إصلاح الخطأ هنا)
     st.divider()
     
     # تجهيز الداتا للعرض
@@ -197,7 +195,7 @@ if st.session_state.po_df is not None:
 
     df_display['Status'] = df_display.apply(get_status, axis=1)
 
-    # تلوين الجدول (Highlighting)
+    # دالة التلوين (تم التعديل لترجع قائمة ألوان لكل الصف)
     def highlight_rows(row):
         color = ''
         if row['Status'] == 'Completed':
@@ -206,7 +204,9 @@ if st.session_state.po_df is not None:
             color = 'background-color: #f8d7da; color: #721c24;' # أحمر فاتح
         elif row['Status'] == 'In Progress':
             color = 'background-color: #fff3cd; color: #856404;' # أصفر فاتح
-        return color
+        
+        # التعديل الهام: إرجاع قائمة باللون مكررة بعدد الأعمدة
+        return [color] * len(row)
 
     st.subheader("📋 تقرير التحضير اللحظي")
     st.dataframe(
