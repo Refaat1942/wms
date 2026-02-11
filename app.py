@@ -4,62 +4,65 @@ import io
 from datetime import datetime, timedelta
 
 # ======================================================
-# 1. إعدادات المشرف (Admin Config)
+# 1. إعدادات وتنسيق الصفحة
 # ======================================================
 ADMIN_PASSWORD = "123" 
+st.set_page_config(page_title="WMS - Smart PO Loader", layout="wide")
 
-st.set_page_config(page_title="WMS - لجنة التحضير الذكية", layout="wide")
-
-# ======================================================
-# 2. تحسين المظهر (CSS Styling - Mobile Friendly)
-# ======================================================
 st.markdown("""
     <style>
-    /* تكبير خانة السكانر للموبايل */
+    /* تكبير خانة السكانر */
     .stTextInput > div > div > input {
         font-size: 20px !important;
-        height: 60px !important; /* ارتفاع أكبر للموبايل */
+        height: 60px !important;
         border: 2px solid #4CAF50 !important;
         text-align: center;
         border-radius: 10px;
     }
-    /* تحسين الجدول */
     .stDataFrame { direction: rtl; }
-    [data-testid="stDataFrame"] td { font-family: 'Arial'; font-size: 16px; }
-    
-    /* إخفاء القوائم العلوية لزيادة المساحة */
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     </style>
     """, unsafe_allow_html=True)
 
 # ======================================================
-# 3. دوال المعالجة (Logic Helpers)
+# 2. دوال مساعدة (Helpers)
 # ======================================================
 def clean_po_data(df):
-    """تنظيف البيانات وإزالة القيم الفارغة NaN"""
+    """تجهيز ملف الـ PO واستخراج رقمه"""
+    # تنظيف أسماء الأعمدة من المسافات الزائدة
     df.columns = [str(c).strip() for c in df.columns]
     
-    rename_map = {
-        'Material': 'Code', 
-        'Short Text': 'Name', 
-        'Order Quantity': 'Required'
-    }
+    # 1. محاولة استخراج رقم الـ PO من عمود Purchasing Document
+    po_number = None
+    # احتمالات لاسم العمود (الأكثر شيوعاً في SAP)
+    target_cols = ['Purchasing Document', 'Purch.Doc.', 'PO Number']
+    
+    for col in target_cols:
+        if col in df.columns:
+            # نأخذ القيمة من أول صف ونحولها لنص
+            val = df[col].iloc[0]
+            if pd.notna(val):
+                po_number = str(val).strip()
+            break
+    
+    # 2. التأكد من باقي الأعمدة الأساسية
+    rename_map = {'Material': 'Code', 'Short Text': 'Name', 'Order Quantity': 'Required'}
     
     for col in rename_map.keys():
         if col not in df.columns:
-            st.error(f"❌ العمود '{col}' ناقص في الملف!")
-            return None
+            return None, None, f"العمود {col} ناقص في الملف!"
 
-    df = df[list(rename_map.keys())].rename(columns=rename_map)
-    df['Code'] = df['Code'].astype(str).str.split('.').str[0].str.strip()
-    df['Name'] = df['Name'].fillna("").astype(str)
-    df['Required'] = pd.to_numeric(df['Required'], errors='coerce').fillna(0).astype(int)
+    # 3. تنظيف الداتا
+    df_clean = df[list(rename_map.keys())].rename(columns=rename_map)
+    df_clean['Code'] = df_clean['Code'].astype(str).str.split('.').str[0].str.strip()
+    df_clean['Name'] = df_clean['Name'].fillna("").astype(str)
+    df_clean['Required'] = pd.to_numeric(df_clean['Required'], errors='coerce').fillna(0).astype(int)
     
-    return df
+    return df_clean, po_number, None
 
 def parse_barcode_sap(text):
-    """معادلة التواريخ (SAP Logic: 01.01.2000 + days)"""
+    """تحليل الباركود وتاريخ الصلاحية"""
     text = str(text).strip()
     if '.' in text:
         try:
@@ -74,126 +77,165 @@ def parse_barcode_sap(text):
     return text, ""
 
 # ======================================================
-# 4. إدارة الحالة (Session State)
+# 3. إدارة الحالة (Session State Database)
 # ======================================================
-if 'po_df' not in st.session_state:
-    st.session_state.po_df = None
-if 'scanned_data' not in st.session_state:
-    st.session_state.scanned_data = {} 
-if 'expiry_map' not in st.session_state:
-    st.session_state.expiry_map = {} 
-if 'expiry_log' not in st.session_state:
-    st.session_state.expiry_log = []
+if 'pos_db' not in st.session_state:
+    st.session_state.pos_db = {} 
+
+if 'active_po' not in st.session_state:
+    st.session_state.active_po = None 
+
 if 'auth_required' not in st.session_state:
     st.session_state.auth_required = False
 if 'pending_scan' not in st.session_state:
     st.session_state.pending_scan = None
-# متغيرات لعرض الرسائل لأن الـ Callback بيشتغل قبل الرسم
+
+# رسائل التنبيه
 if 'msg_success' not in st.session_state:
     st.session_state.msg_success = None
 if 'msg_error' not in st.session_state:
     st.session_state.msg_error = None
 
 # ======================================================
-# 5. دالة الـ Callback (المسؤولة عن المسح التلقائي)
+# 4. دالة السكانر (Callback)
 # ======================================================
 def process_scan():
-    """هذه الدالة تنفذ عند الضغط على Enter"""
-    barcode = st.session_state.scanner_input # قراءة القيمة
-    
-    if not barcode:
+    """معالجة الباركود للملف النشط حالياً"""
+    barcode = st.session_state.scanner_input
+    active_po_name = st.session_state.active_po
+
+    if not barcode or not active_po_name:
         return
 
+    current_db = st.session_state.pos_db[active_po_name]
     mat_id, exp_date = parse_barcode_sap(barcode)
-    
-    # 1. التحقق من وجود الصنف
-    if mat_id in st.session_state.po_df['Code'].values:
-        required_qty = st.session_state.po_df.loc[st.session_state.po_df['Code'] == mat_id, 'Required'].values[0]
-        current_qty = st.session_state.scanned_data.get(mat_id, 0)
-        
-        # 2. التحقق من الكمية
+
+    # هل الصنف موجود؟
+    if mat_id in current_db['df']['Code'].values:
+        required_qty = current_db['df'].loc[current_db['df']['Code'] == mat_id, 'Required'].values[0]
+        current_qty = current_db['scanned'].get(mat_id, 0)
+
         if current_qty < required_qty:
-            # عملية ناجحة
-            st.session_state.scanned_data[mat_id] = current_qty + 1
+            current_db['scanned'][mat_id] = current_qty + 1
             if exp_date:
-                st.session_state.expiry_map[mat_id] = exp_date
+                current_db['expiry'][mat_id] = exp_date
             
-            st.session_state.expiry_log.append({
+            current_db['log'].append({
                 "Code": mat_id, "Expiry": exp_date, "Time": datetime.now().strftime("%H:%M:%S"), "Note": "Normal"
             })
-            st.session_state.msg_success = f"✅ تم: {mat_id}"
-            st.session_state.msg_error = None
+            st.session_state.msg_success = f"✅ {mat_id}"
         else:
-            # طلب إذن مشرف (نوقف ونطلب باسورد)
             st.session_state.auth_required = True
-            st.session_state.pending_scan = {'mat': mat_id, 'exp': exp_date}
-            st.session_state.msg_success = None
-            st.session_state.msg_error = None
+            st.session_state.pending_scan = {'mat': mat_id, 'exp': exp_date, 'po': active_po_name}
     else:
-        st.session_state.msg_error = f"❌ غير موجود: {mat_id}"
-        st.session_state.msg_success = None
+        st.session_state.msg_error = f"❌ غير موجود في {active_po_name}"
 
-    # 🔥 السطر السحري: مسح الخانة بعد الانتهاء
     st.session_state.scanner_input = ""
 
 # ======================================================
-# 6. الواجهة والتشغيل
+# 5. الواجهة والقوائم الجانبية
 # ======================================================
-st.title("📦 نظام التحضير الآمن")
+st.title("📦 نظام إدارة الـ PO الذكي")
 
-# عرض رسائل النجاح أو الخطأ القادمة من الـ Callback
+# عرض الرسائل
 if st.session_state.msg_success:
     st.toast(st.session_state.msg_success, icon="📦")
-    st.session_state.msg_success = None # تصفير الرسالة
+    st.session_state.msg_success = None
 if st.session_state.msg_error:
     st.error(st.session_state.msg_error)
-    st.session_state.msg_error = None # تصفير الرسالة
+    st.session_state.msg_error = None
 
-# --- القائمة الجانبية ---
 with st.sidebar:
-    st.header("⚙️ التحكم")
-    uploaded_file = st.file_uploader("رفع ملف PO", type=['xlsx'])
+    st.header("🗂️ إدارة الملفات")
     
-    if uploaded_file and st.session_state.po_df is None:
+    # 1. رفع ملف جديد
+    uploaded_file = st.file_uploader("➕ إضافة PO جديد", type=['xlsx'], key="file_uploader")
+    
+    if uploaded_file:
+        # قراءة الملف مرة واحدة فقط عند الرفع
         try:
             df_raw = pd.read_excel(uploaded_file, engine='openpyxl')
-            st.session_state.po_df = clean_po_data(df_raw)
-            st.success("✅ تم التحميل بنجاح")
+            df_clean, extracted_po_num, error_msg = clean_po_data(df_raw)
+            
+            if df_clean is not None:
+                # تحديد الاسم النهائي: لو لقينا رقم PO نستخدمه، لو ملقيناش نستخدم اسم الملف
+                final_name = extracted_po_num if extracted_po_num else uploaded_file.name
+                
+                if final_name in st.session_state.pos_db:
+                    st.warning(f"⚠️ الـ PO رقم {final_name} موجود بالفعل!")
+                else:
+                    st.session_state.pos_db[final_name] = {
+                        'df': df_clean,
+                        'scanned': {},
+                        'expiry': {},
+                        'log': []
+                    }
+                    st.session_state.active_po = final_name
+                    st.success(f"تم تحميل PO: {final_name}")
+                    st.rerun()
+            else:
+                st.error(error_msg)
         except Exception as e:
-            st.error(f"خطأ في الملف: {e}")
+            st.error(f"حدث خطأ في قراءة الملف: {e}")
 
-    if st.button("🔴 إنهاء ومسح الكل"):
-        st.session_state.clear()
-        st.rerun()
+    st.divider()
 
-# --- الشاشة الرئيسية ---
-if st.session_state.po_df is not None:
-
-    # حالة طلب الباسورد
-    if st.session_state.auth_required:
-        st.warning("⚠️ الكمية المطلوبة اكتملت! مطلوب إذن مشرف للزيادة.")
-        col_pass, col_btn = st.columns([3, 1])
-        password_input = col_pass.text_input("Admin Password", type="password", key="auth_pass")
+    # 2. القائمة المنسدلة (تظهر بأسماء الـ PO الآن)
+    if st.session_state.pos_db:
+        po_list = list(st.session_state.pos_db.keys())
         
-        if col_btn.button("موافقة"):
-            if password_input == ADMIN_PASSWORD:
-                mat_to_add = st.session_state.pending_scan['mat']
-                exp_to_add = st.session_state.pending_scan['exp']
+        index = 0
+        if st.session_state.active_po in po_list:
+            index = po_list.index(st.session_state.active_po)
+            
+        selected_po = st.selectbox("📂 اختر أمر الشراء:", po_list, index=index)
+        
+        # تحديث الاختيار فقط لو اتغير
+        if selected_po != st.session_state.active_po:
+            st.session_state.active_po = selected_po
+            st.rerun()
+        
+        # زر الحذف
+        col_del, col_space = st.columns([1, 2])
+        if col_del.button("🗑️ حذف"):
+            del st.session_state.pos_db[selected_po]
+            st.session_state.active_po = None
+            st.rerun()
+    else:
+        st.info("لا توجد ملفات مفتوحة.")
+
+# ======================================================
+# 6. منطقة العمل الرئيسية
+# ======================================================
+
+if st.session_state.active_po and st.session_state.active_po in st.session_state.pos_db:
+    current_po_data = st.session_state.pos_db[st.session_state.active_po]
+    
+    # --- أ. معالجة طلب الباسورد ---
+    if st.session_state.auth_required:
+        st.warning(f"⚠️ زيادة كمية في الملف: {st.session_state.pending_scan['po']}")
+        c_pass, c_btn = st.columns([3, 1])
+        pwd = c_pass.text_input("كلمة مرور المشرف", type="password", key="admin_pass")
+        
+        if c_btn.button("موافقة"):
+            if pwd == ADMIN_PASSWORD:
+                p_scan = st.session_state.pending_scan
+                target_db = st.session_state.pos_db[p_scan['po']]
                 
-                st.session_state.scanned_data[mat_to_add] = st.session_state.scanned_data.get(mat_to_add, 0) + 1
-                if exp_to_add:
-                    st.session_state.expiry_map[mat_to_add] = exp_to_add
+                target_db['scanned'][p_scan['mat']] = target_db['scanned'].get(p_scan['mat'], 0) + 1
+                if p_scan['exp']:
+                    target_db['expiry'][p_scan['mat']] = p_scan['exp']
                 
-                st.session_state.expiry_log.append({
-                    "Code": mat_to_add, "Expiry": exp_to_add, "Time": datetime.now().strftime("%H:%M:%S"), "Note": "Over-delivery (Authorized)"
+                target_db['log'].append({
+                    "Code": p_scan['mat'], "Expiry": p_scan['exp'], "Time": datetime.now().strftime("%H:%M:%S"), "Note": "Over-delivery (Authorized)"
                 })
                 
-                st.success(f"تمت الزيادة بتصريح مشرف للصنف {mat_to_add}")
                 st.session_state.auth_required = False
                 st.session_state.pending_scan = None
+                st.success("تم التصريح")
                 st.rerun()
             else:
-                st.error("❌ كلمة المرور غير صحيحة")
+                st.error("كلمة المرور خطأ")
         
         if st.button("إلغاء"):
             st.session_state.auth_required = False
@@ -201,73 +243,62 @@ if st.session_state.po_df is not None:
             st.rerun()
 
     else:
-        # خانة السكانر المرتبطة بالـ Callback
+        # --- ب. خانة السكانر ---
+        st.subheader(f"رقم الملف: {st.session_state.active_po}")
+        
         st.text_input(
-            "👇 اسحب الباركود هنا", 
+            "👇 اسحب الباركود", 
             key="scanner_input", 
-            placeholder="Scan Barcode...", 
-            on_change=process_scan  # 🔥 الاستدعاء هنا
+            on_change=process_scan
         )
 
-    # عرض الجدول
-    st.divider()
-    
-    df_display = st.session_state.po_df.copy()
-    df_display['Scanned'] = df_display['Code'].map(st.session_state.scanned_data).fillna(0).astype(int)
-    df_display['Expiry Date'] = df_display['Code'].map(st.session_state.expiry_map).fillna("")
-    df_display['Remaining'] = df_display['Required'] - df_display['Scanned']
-    
-    def get_status(row):
-        scanned = row['Scanned']
-        required = row['Required']
-        if scanned == 0: return "Pending"
-        if scanned < required: return "In Progress"
-        if scanned == required: return "Completed"
-        return "Over Delivered"
+        # --- ج. عرض الجدول ---
+        df_display = current_po_data['df'].copy()
+        
+        df_display['Scanned'] = df_display['Code'].map(current_po_data['scanned']).fillna(0).astype(int)
+        df_display['Expiry'] = df_display['Code'].map(current_po_data['expiry']).fillna("")
+        df_display['Remaining'] = df_display['Required'] - df_display['Scanned']
+        
+        def get_status(row):
+            if row['Scanned'] == 0: return "Pending"
+            if row['Scanned'] < row['Required']: return "In Progress"
+            if row['Scanned'] == row['Required']: return "Completed"
+            return "Over Delivered"
 
-    df_display['Status'] = df_display.apply(get_status, axis=1)
+        df_display['Status'] = df_display.apply(get_status, axis=1)
 
-    # تنظيف الأصفار للعرض
-    df_show = df_display.copy()
-    df_show['Scanned'] = df_show['Scanned'].replace(0, "")
-    df_show['Remaining'] = df_show['Remaining'].replace(0, "")
-    
-    def highlight_rows(row):
-        color = ''
-        status = row['Status']
-        if status == 'Completed':
-            color = 'background-color: #d4edda; color: #155724;' 
-        elif status == 'Over Delivered':
-            color = 'background-color: #f8d7da; color: #721c24;' 
-        elif status == 'In Progress':
-            color = 'background-color: #fff3cd; color: #856404;' 
-        return [color] * len(row)
+        # تنظيف العرض
+        df_show = df_display.copy()
+        df_show['Scanned'] = df_show['Scanned'].replace(0, "")
+        df_show['Remaining'] = df_show['Remaining'].replace(0, "")
 
-    st.subheader("📋 تقرير التحضير اللحظي")
-    cols_to_show = ['Code', 'Name', 'Expiry Date', 'Required', 'Scanned', 'Remaining', 'Status']
-    
-    st.dataframe(
-        df_show[cols_to_show].style.apply(highlight_rows, axis=1),
-        use_container_width=True,
-        height=500
-    )
+        def highlight_rows(row):
+            color = ''
+            if row['Status'] == 'Completed': color = 'background-color: #d4edda'
+            elif row['Status'] == 'Over Delivered': color = 'background-color: #f8d7da'
+            elif row['Status'] == 'In Progress': color = 'background-color: #fff3cd'
+            return [color] * len(row)
 
-    # التصدير
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("💾 تحميل شيت الفروقات"):
+        st.dataframe(
+            df_show[['Code', 'Name', 'Expiry', 'Required', 'Scanned', 'Remaining', 'Status']].style.apply(highlight_rows, axis=1),
+            use_container_width=True,
+            height=450
+        )
+
+        # --- د. التصدير ---
+        if st.button(f"💾 تحميل تقرير {st.session_state.active_po}"):
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
                 df_display.to_excel(writer, index=False, sheet_name='Summary')
-                if st.session_state.expiry_log:
-                    pd.DataFrame(st.session_state.expiry_log).to_excel(writer, index=False, sheet_name='Details')
+                if current_po_data['log']:
+                    pd.DataFrame(current_po_data['log']).to_excel(writer, index=False, sheet_name='Logs')
             
             st.download_button(
-                label="📥 تنزيل Excel",
+                label="📥 تنزيل الملف",
                 data=output.getvalue(),
-                file_name="WMS_Final_Report.xlsx",
+                file_name=f"Report_{st.session_state.active_po}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
 
 else:
-    st.info("👈 يرجى رفع ملف الـ PO للبدء")
+    st.info("👈 قم برفع ملف PO من القائمة الجانبية للبدء")
